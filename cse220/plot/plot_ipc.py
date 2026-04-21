@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import argparse
 import pandas as pd
 import matplotlib
@@ -33,17 +34,23 @@ def get_IPC(descriptor_data, sim_path, output_dir):
       ipc_config = []
       avg_IPC_config = 0.0
       cnt_benchmarks = 0
+      ipc_pattern = re.compile(r"--\s*([\d\.]+)\s*IPC")
       for benchmark in benchmarks_org:
         benchmark_name = benchmark.split("/")
         exp_path = sim_path+'/'+benchmark+'/'+descriptor_data["experiment"]+'/'
         IPC = 0
-        with open(exp_path+config_key+'/memory.stat.0.csv') as f:
+        with open(exp_path+config_key+'/sim.log') as f:
           lines = f.readlines()
           for line in lines:
-            if 'Periodic IPC' in line:
-              tokens = [x.strip() for x in line.split(',')]
-              IPC = float(tokens[1])
+            match = ipc_pattern.search(line)
+            if match:
+              ipc_value = match.group(1)
+              IPC = float(ipc_value)
               break
+            # if 'Periodic IPC' in line:
+            #   tokens = [x.strip() for x in line.split(',')]
+            #   IPC = float(tokens[1])
+            #   break
 
         avg_IPC_config += IPC
 

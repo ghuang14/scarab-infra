@@ -62,7 +62,7 @@ start=`date +%s`
 mkdir -p $SIMHOME/$SCENARIONUM
 cp $SCARABHOME/src/PARAMS.$SCARABARCH $SIMHOME/$SCENARIONUM/PARAMS.in
 cd $SIMHOME/$SCENARIONUM
-scarabCmd="$SCARABHOME/src/scarab --frontend memtrace --cbp_trace_r0 $TRACEFILE --memtrace_modules_log $MODULESDIR --memtrace_roi_begin 1 --memtrace_roi_end 20000000 --inst_limit 20000000 --full_warmup $WARMUP --use_fetched_count=0 $SCARABPARAMS &> sim.log"
+scarabCmd="$SCARABHOME/src/scarab --frontend memtrace --cbp_trace_r0 $TRACEFILE --memtrace_roi_begin 1 --memtrace_roi_end 20000000 --inst_limit 20000000 --full_warmup $WARMUP --use_fetched_count=0 $SCARABPARAMS &> sim.log"
 echo "simulating ..."
 echo "command: ${scarabCmd}"
 eval $scarabCmd &

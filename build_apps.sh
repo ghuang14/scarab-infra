@@ -3,11 +3,97 @@ LOCAL_GID=$(id -g $USER)
 USER_ID=${LOCAL_UID:-9001}
 GROUP_ID=${LOCAL_GID:-9001}
 
+DOCKER_PLATFORM_ARGS=()
+if [ "$(uname -s)" == "Darwin" ]; then
+  # Docker Desktop on Apple Silicon should use amd64 for Pin/Scarab tooling.
+  DOCKER_PLATFORM_ARGS=(--platform linux/amd64)
+fi
+
+run_step() {
+  "$@"
+  local status=$?
+  if [ $status -ne 0 ]; then
+    return $status
+  fi
+}
+
+is_positive_int() {
+  case "$1" in
+    ''|*[!0-9]*|0)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+detect_scarab_build_jobs() {
+  if is_positive_int "${SCARAB_BUILD_JOBS:-}"; then
+    printf '%s\n' "$SCARAB_BUILD_JOBS"
+    return 0
+  fi
+
+  local cpu_count=2
+  if command -v getconf >/dev/null 2>&1; then
+    cpu_count="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')"
+  elif command -v nproc >/dev/null 2>&1; then
+    cpu_count="$(nproc 2>/dev/null || printf '2')"
+  fi
+
+  if ! is_positive_int "$cpu_count"; then
+    cpu_count=2
+  fi
+
+  if [ "$(uname -s)" == "Darwin" ]; then
+    # Docker Desktop tends to run out of memory before CPU on Scarab's DynamoRIO build.
+    if [ "$cpu_count" -gt 2 ]; then
+      cpu_count=2
+    fi
+  elif [ "$cpu_count" -gt 4 ]; then
+    cpu_count=4
+  fi
+
+  printf '%s\n' "$cpu_count"
+}
+
+patch_scarab_makefile() {
+  local makefile="$OUTDIR/scarab/src/Makefile"
+  local jobs="$1"
+
+  if [ ! -f "$makefile" ]; then
+    return 0
+  fi
+
+  SCARAB_PATCH_JOBS="$jobs" perl -0pi -e '
+    my $jobs = $ENV{SCARAB_PATCH_JOBS};
+    s/^SCARAB_MAKE_JOBS \?= .*$/SCARAB_MAKE_JOBS ?= $jobs/m
+      or s/^(BUILD_DIR_PREFIX = build\n)/$1\nSCARAB_MAKE_JOBS ?= $jobs\n/m;
+    s/^\tmake --no-print-directory -j all$/\t\$(MAKE) --no-print-directory -j\$(SCARAB_MAKE_JOBS) all/m;
+    s/^\t\@make -j --no-print-directory -C \$\(dir \$@\)$/\t\@\$(MAKE) -j\$(SCARAB_MAKE_JOBS) --no-print-directory -C \$(dir \$@)/m;
+  ' "$makefile"
+}
+
+build_scarab_in_container() {
+  patch_scarab_makefile "$SCARAB_BUILD_JOBS_LIMIT" || return $?
+  echo "building scarab with $SCARAB_BUILD_JOBS_LIMIT parallel job(s).."
+  run_step docker exec --user=$USER --privileged "$CONTAINER_NAME" /bin/bash -c "cd /home/$USER/scarab/src && make clean && make SCARAB_MAKE_JOBS=$SCARAB_BUILD_JOBS_LIMIT" || return $?
+}
+
+SCARAB_BUILD_JOBS_LIMIT="$(detect_scarab_build_jobs)"
+
+CONTAINER_NAME="${APP_GROUPNAME}_$USER"
+
+# A fresh rebuild should replace any prior container using the same mounted home.
+if [ "$BUILD" == "2" ] && docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+  run_step docker rm -f "$CONTAINER_NAME" || return $?
+fi
+
 # build from the beginning and overwrite whatever image with the same name
-if [ $BUILD == 2 ]; then
-  docker build . -f ./$APP_GROUPNAME/Dockerfile --no-cache -t $APP_GROUPNAME:latest
-elif [ $BUILD == 1 ]; then # find the existing cache/image and start from there
-  docker build . -f ./$APP_GROUPNAME/Dockerfile -t $APP_GROUPNAME:latest
+if [ "$BUILD" == "2" ]; then
+  run_step docker build "${DOCKER_PLATFORM_ARGS[@]}" . -f "./$APP_GROUPNAME/Dockerfile" --no-cache -t "$APP_GROUPNAME:latest" || return $?
+elif [ "$BUILD" == "1" ]; then # find the existing cache/image and start from there
+  run_step docker build "${DOCKER_PLATFORM_ARGS[@]}" . -f "./$APP_GROUPNAME/Dockerfile" -t "$APP_GROUPNAME:latest" || return $?
 fi
 
 # create volume for the app group
@@ -23,68 +109,68 @@ case $APP_GROUPNAME in
       echo "dataset exists"
     else
       echo "dataset does not exist, downloading"
-      docker run --name web_search_dataset cloudsuite/web-search:dataset
+      run_step docker run --name web_search_dataset cloudsuite/web-search:dataset || return $?
     fi
     # must mount dataset volume for server and docker to start querying
-    docker exec -it --privileged $APP_GROUPNAME\_$USER /bin/bash -c "/usr/local/bin/entrypoint.sh"
-    docker exec -it -d --privileged $APP_GROUPNAME\_$USER /bin/bash -c '(docker run -it --name web_search_client --net host cloudsuite/web-search:client $(hostname -I) 10; pkill java)'
-    docker run -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name $APP_GROUPNAME\_$USER --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash
-    docker start $APP_GROUPNAME\_$USER
-    docker exec --privileged $APP_GROUPNAME\_$USER /bin/bash -c "/usr/local/bin/common_entrypoint.sh"
-    docker exec --user=$USER --privileged $APP_GROUPNAME\_$USER /bin/bash -c "cd /home/$USER/scarab/src && make clean && make"
-    ;;
+    run_step docker exec -it --privileged "$CONTAINER_NAME" /bin/bash -c "/usr/local/bin/entrypoint.sh" || return $?
+	    run_step docker exec -it -d --privileged "$CONTAINER_NAME" /bin/bash -c '(docker run -it --name web_search_client --net host cloudsuite/web-search:client $(hostname -I) 10; pkill java)' || return $?
+	    run_step docker run "${DOCKER_PLATFORM_ARGS[@]}" -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name "$CONTAINER_NAME" --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash || return $?
+	    run_step docker start "$CONTAINER_NAME" || return $?
+	    run_step docker exec --privileged "$CONTAINER_NAME" /bin/bash -c "/usr/local/bin/common_entrypoint.sh" || return $?
+	    build_scarab_in_container || return $?
+	    ;;
   spec2017)
-    docker run -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name $APP_GROUPNAME\_$USER --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash
-    docker start $APP_GROUPNAME\_$USER
-    docker exec --privileged $APP_GROUPNAME\_$USER /bin/bash -c "/usr/local/bin/common_entrypoint.sh"
-    docker exec --user=$USER --privileged $APP_GROUPNAME\_$USER /bin/bash -c "cd /home/$USER/scarab/src && make clean && make"
-    docker exec --privileged $APP_GROUPNAME\_$USER /bin/bash -c "\$tmpdir/entrypoint.sh"
-    docker exec --user=$USER --privileged $APP_GROUPNAME\_$USER /bin/bash -c "\$tmpdir/install.sh"
-    ;;
+	    run_step docker run "${DOCKER_PLATFORM_ARGS[@]}" -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name "$CONTAINER_NAME" --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash || return $?
+	    run_step docker start "$CONTAINER_NAME" || return $?
+	    run_step docker exec --privileged "$CONTAINER_NAME" /bin/bash -c "/usr/local/bin/common_entrypoint.sh" || return $?
+	    build_scarab_in_container || return $?
+	    run_step docker exec --privileged "$CONTAINER_NAME" /bin/bash -c "\$tmpdir/entrypoint.sh" || return $?
+	    run_step docker exec --user=$USER --privileged "$CONTAINER_NAME" /bin/bash -c "\$tmpdir/install.sh" || return $?
+	    ;;
   sysbench)
-    docker run -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name $APP_GROUPNAME\_$USER --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash
-    docker start $APP_GROUPNAME\_$USER
-    docker exec --privileged $APP_GROUPNAME\_$USER /bin/bash -c "/usr/local/bin/common_entrypoint.sh"
-    docker exec --user=$USER --privileged $APP_GROUPNAME\_$USER /bin/bash -c "cd /home/$USER/scarab/src && make clean && make"
-    docker exec --privileged $APP_GROUPNAME\_$USER /bin/bash -c "/usr/local/bin/entrypoint.sh \"$APPNAME\""
-    ;;
+	    run_step docker run "${DOCKER_PLATFORM_ARGS[@]}" -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name "$CONTAINER_NAME" --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash || return $?
+	    run_step docker start "$CONTAINER_NAME" || return $?
+	    run_step docker exec --privileged "$CONTAINER_NAME" /bin/bash -c "/usr/local/bin/common_entrypoint.sh" || return $?
+	    build_scarab_in_container || return $?
+	    run_step docker exec --privileged "$CONTAINER_NAME" /bin/bash -c "/usr/local/bin/entrypoint.sh \"$APPNAME\"" || return $?
+	    ;;
   allbench_traces)
-    docker run -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name $APP_GROUPNAME\_$USER --mount type=bind,source=/soe/hlitz/lab/traces,target=/simpoint_traces,readonly --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash
-    docker start $APP_GROUPNAME\_$USER
-    docker exec --privileged $APP_GROUPNAME\_$USER /bin/bash -c "/usr/local/bin/common_entrypoint.sh"
-    docker exec --user=$USER --privileged $APP_GROUPNAME\_$USER /bin/bash -c "cd /home/$USER/scarab/src && make clean && make"
-    ;;
+	    run_step docker run "${DOCKER_PLATFORM_ARGS[@]}" -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name "$CONTAINER_NAME" --mount type=bind,source=/soe/hlitz/lab/traces,target=/simpoint_traces,readonly --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash || return $?
+	    run_step docker start "$CONTAINER_NAME" || return $?
+	    run_step docker exec --privileged "$CONTAINER_NAME" /bin/bash -c "/usr/local/bin/common_entrypoint.sh" || return $?
+	    build_scarab_in_container || return $?
+	    ;;
   isca2024_udp)
-    docker run -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name $APP_GROUPNAME\_$USER --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash
-    docker start $APP_GROUPNAME\_$USER
-    docker exec --privileged $APP_GROUPNAME\_$USER /bin/bash -c "/usr/local/bin/entrypoint.sh"
-    docker exec --user=$USER --privileged $APP_GROUPNAME\_$USER /bin/bash -c "cd /home/$USER/scarab/src && make clean && make"
-    ;;
+	    run_step docker run "${DOCKER_PLATFORM_ARGS[@]}" -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name "$CONTAINER_NAME" --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash || return $?
+	    run_step docker start "$CONTAINER_NAME" || return $?
+	    run_step docker exec --privileged "$CONTAINER_NAME" /bin/bash -c "/usr/local/bin/entrypoint.sh" || return $?
+	    build_scarab_in_container || return $?
+	    ;;
   cse220)
-    docker run -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name $APP_GROUPNAME\_$USER --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash
-    docker start $APP_GROUPNAME\_$USER
-    docker exec --privileged $APP_GROUPNAME\_$USER /bin/bash -c "/usr/local/bin/entrypoint.sh"
-    docker exec --user=$USER --privileged $APP_GROUPNAME\_$USER /bin/bash -c "cd /home/$USER/scarab/src && make clean && make"
-    ;;
+	    run_step docker run "${DOCKER_PLATFORM_ARGS[@]}" -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name "$CONTAINER_NAME" --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash || return $?
+	    run_step docker start "$CONTAINER_NAME" || return $?
+	    run_step docker exec --privileged "$CONTAINER_NAME" /bin/bash -c "/usr/local/bin/entrypoint.sh" || return $?
+	    build_scarab_in_container || return $?
+	    ;;
   docker_traces)
-    docker run -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name $APP_GROUPNAME\_$USER --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash
-    docker start $APP_GROUPNAME\_$USER
-    docker exec --privileged $APP_GROUPNAME\_$USER /bin/bash -c "/usr/local/bin/entrypoint.sh"
-    docker exec --user=$USER --privileged $APP_GROUPNAME\_$USER /bin/bash -c "cd /home/$USER/scarab/src && make clean && make"
-    ;;
+	    run_step docker run "${DOCKER_PLATFORM_ARGS[@]}" -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name "$CONTAINER_NAME" --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash || return $?
+	    run_step docker start "$CONTAINER_NAME" || return $?
+	    run_step docker exec --privileged "$CONTAINER_NAME" /bin/bash -c "/usr/local/bin/entrypoint.sh" || return $?
+	    build_scarab_in_container || return $?
+	    ;;
   example)
-    docker run -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name $APP_GROUPNAME\_$USER --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash
-    docker start $APP_GROUPNAME\_$USER
-    docker exec --privileged $APP_GROUPNAME\_$USER /bin/bash -c "/usr/local/bin/common_entrypoint.sh"
-    docker exec --user=$USER --privileged $APP_GROUPNAME\_$USER /bin/bash -c "cd /home/$USER/scarab/src && make clean && make"
-    docker exec --user=$USER --privileged $APP_GROUPNAME\_$USER /bin/bash -c "cd /home/$USER/scarab/utils/qsort && make test_qsort"
-    ;;
+	    run_step docker run "${DOCKER_PLATFORM_ARGS[@]}" -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name "$CONTAINER_NAME" --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash || return $?
+	    run_step docker start "$CONTAINER_NAME" || return $?
+	    run_step docker exec --privileged "$CONTAINER_NAME" /bin/bash -c "/usr/local/bin/common_entrypoint.sh" || return $?
+	    build_scarab_in_container || return $?
+	    run_step docker exec --user=$USER --privileged "$CONTAINER_NAME" /bin/bash -c "cd /home/$USER/scarab/utils/qsort && make test_qsort" || return $?
+	    ;;
   *)
-    docker run -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name $APP_GROUPNAME\_$USER --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash
-    docker start $APP_GROUPNAME\_$USER
-    docker exec --privileged $APP_GROUPNAME\_$USER /bin/bash -c "/usr/local/bin/common_entrypoint.sh"
-    docker exec --user=$USER --privileged $APP_GROUPNAME\_$USER /bin/bash -c "cd /home/$USER/scarab/src && make clean && make"
-    ;;
+	    run_step docker run "${DOCKER_PLATFORM_ARGS[@]}" -e user_id=$USER_ID -e group_id=$GROUP_ID -e username=$USER -e HOME=/home/$USER -dit --privileged --name "$CONTAINER_NAME" --mount type=bind,source=$OUTDIR,target=/home/$USER $APP_GROUPNAME:latest /bin/bash || return $?
+	    run_step docker start "$CONTAINER_NAME" || return $?
+	    run_step docker exec --privileged "$CONTAINER_NAME" /bin/bash -c "/usr/local/bin/common_entrypoint.sh" || return $?
+	    build_scarab_in_container || return $?
+	    ;;
 esac
 
 # Build scarab

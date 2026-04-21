@@ -24,6 +24,8 @@ docker system prune
 ```
 ./run.sh -o <path_to_mount_docker_home> -b 2
 ```
+The `-o` path is the host directory mounted as `/home/$USER` inside the container. Use a dedicated directory for this workflow, not the `scarab-infra` repository directory.
+
 For example, on a Linux system,
 ```
 ./run.sh -o /home/$USER/cse220_home -b 2
@@ -42,6 +44,7 @@ You will also see `scarab` repository cloned and successfully built at `/home/$U
 ## 2. Run Scarab simulations by using a descriptor file
 The example file descriptor for the simulation scenarios for the lab is already in `cse220/lab1.json`
 Open and edit the json file to select workloads and scenarios before running it.
+Run this step after the build command above has created the standard `cse220_$USER` container and the `scarab` checkout inside your `cse220_home` directory.
 Run the following command with <experiment> name for -e. The simulations using memtraces for the selected SPEC benchmarks should be launched with a simulation mode `220`.
 On a Linux system,
 ```

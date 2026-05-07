@@ -20,11 +20,37 @@ die() {
   exit 1
 }
 
+run_step() {
+  "$@"
+  local status=$?
+  if [ $status -ne 0 ]; then
+    return $status
+  fi
+}
+
 normalize_dirpath() {
   local path="$1"
   while [[ "$path" != "/" && "$path" == */ ]]; do
     path="${path%/}"
   done
+  printf '%s\n' "$path"
+}
+
+normalize_host_outdir() {
+  local path="$1"
+
+  if [ "$(uname -s)" == "Darwin" ]; then
+    local linux_home="/home/$USER"
+    local mac_home="/Users/$USER"
+    case "$path" in
+      "$linux_home"|"$linux_home"/*)
+        local mapped="$mac_home${path#"$linux_home"}"
+        echo "Warning: macOS cannot use '$path' as a host mount path; using '$mapped' instead." >&2
+        path="$mapped"
+        ;;
+    esac
+  fi
+
   printf '%s\n' "$path"
 }
 
@@ -34,6 +60,16 @@ require_option_arg() {
   if [ -z "$value" ] || [[ "$value" == -* ]]; then
     die "Option '$option' requires an argument."
   fi
+}
+
+copy_experiment_descriptor() {
+  local descriptor="$1"
+
+  if [ ! -f "$descriptor" ]; then
+    die "Experiment descriptor '$descriptor' not found."
+  fi
+
+  run_step cp "$descriptor" "$OUTDIR/" || exit $?
 }
 
 # help function
@@ -174,6 +210,8 @@ if [ -z "$OUTDIR" ]; then
 fi
 
 OUTDIR="$(normalize_dirpath "$OUTDIR")"
+OUTDIR="$(normalize_host_outdir "$OUTDIR")"
+OUTDIR="$(normalize_dirpath "$OUTDIR")"
 REPO_ROOT="$(normalize_dirpath "$REPO_ROOT")"
 
 case "$OUTDIR" in
@@ -201,51 +239,55 @@ mkdir -p "$OUTDIR"
 
 source utilities.sh
 
-# build docker images and start containers
-echo "build docker images and start containers.."
-taskPids=()
-start=`date +%s`
-while read APPNAME ;do
-  source setup_apps.sh
+if [ -n "$BUILD" ] || [ -n "$SIMPOINT" ]; then
+  # build docker images and start containers
+  echo "build docker images and start containers.."
+  taskPids=()
+  start=`date +%s`
+  while read APPNAME ;do
+    source setup_apps.sh
 
-  if [ -n "$BUILD" ]; then
-    source build_apps.sh || exit $?
-  fi
+    if [ -n "$BUILD" ]; then
+      source build_apps.sh || exit $?
+    fi
+
+    if [ -n "$SIMPOINT" ]; then
+      if [ "$APPNAME" == "allbench" ]; then
+        echo "allbench is only for trace-based simulations with the traces from UCSC NFS"
+        exit 1
+      fi
+      CONTAINER_NAME="${APP_GROUPNAME}_$USER"
+      # run simpoint/trace
+      echo "run simpoint/trace.."
+
+      # tokenize multiple environment variables
+      ENVVARS=""
+      echo $ENVVARS
+      for token in $ENVVAR;
+      do
+         ENVVARS+=" -e ";
+         ENVVARS+=$token;
+      done
+
+      # update the script
+      docker cp ./run_simpoint_trace.sh "$CONTAINER_NAME":/usr/local/bin
+      docker exec $ENVVARS --user $USER --workdir /home/$USER --privileged "$CONTAINER_NAME" run_simpoint_trace.sh "$APPNAME" "$APP_GROUPNAME" "$BINCMD" "$SIMPOINT" "$DRIO_ARGS" &
+      sleep 2
+      while read -r line ;do
+        IFS=" " read PID CMD <<< $line
+        if [ "$CMD" == "/bin/bash /usr/local/bin/run_simpoint_trace.sh $APPNAME $APP_GROUPNAME $BINCMD $SIMPOINT $DRIO_ARGS" ]; then
+          taskPids+=($PID)
+        fi
+      done < <(docker top "$CONTAINER_NAME" -eo pid,cmd)
+    fi
+  done < apps.list
 
   if [ -n "$SIMPOINT" ]; then
-    if [ "$APPNAME" == "allbench" ]; then
-      echo "allbench is only for trace-based simulations with the traces from UCSC NFS"
-      exit 1
-    fi
-    CONTAINER_NAME="${APP_GROUPNAME}_$USER"
-    # run simpoint/trace
-    echo "run simpoint/trace.."
-
-    # tokenize multiple environment variables
-    ENVVARS=""
-    echo $ENVVARS
-    for token in $ENVVAR;
-    do
-       ENVVARS+=" -e ";
-       ENVVARS+=$token;
-    done
-
-    # update the script
-    docker cp ./run_simpoint_trace.sh "$CONTAINER_NAME":/usr/local/bin
-    docker exec $ENVVARS --user $USER --workdir /home/$USER --privileged "$CONTAINER_NAME" run_simpoint_trace.sh "$APPNAME" "$APP_GROUPNAME" "$BINCMD" "$SIMPOINT" "$DRIO_ARGS" &
-    sleep 2
-    while read -r line ;do
-      IFS=" " read PID CMD <<< $line
-      if [ "$CMD" == "/bin/bash /usr/local/bin/run_simpoint_trace.sh $APPNAME $APP_GROUPNAME $BINCMD $SIMPOINT $DRIO_ARGS" ]; then
-        taskPids+=($PID)
-      fi
-    done < <(docker top "$CONTAINER_NAME" -eo pid,cmd)
+    wait_for_non_child "simpoint/tracing" "${taskPids[@]}"
+    end=`date +%s`
+    report_time "post-processing" "$start" "$end"
   fi
-done < apps.list
-
-wait_for_non_child "simpoint/tracing" "${taskPids[@]}"
-end=`date +%s`
-report_time "post-processing" "$start" "$end"
+fi
 
 if [ -n "$SCARABMODE" ]; then
   # run Scarab simulation
@@ -264,7 +306,7 @@ if [ -n "$SCARABMODE" ]; then
       docker cp ./run_exp_using_descriptor.py "$CONTAINER_NAME":/usr/local/bin
     fi
     if [ "$APP_GROUPNAME" == "allbench_traces" ]; then
-      cp "${EXPERIMENT}.json" "$OUTDIR"
+      copy_experiment_descriptor "${EXPERIMENT}.json"
       docker exec --user $USER --workdir /home/$USER --privileged "$CONTAINER_NAME" python3 /usr/local/bin/run_exp_using_descriptor.py -d $EXPERIMENT.json -a $APPNAME -g $APP_GROUPNAME -m $SCARABMODE &
       while read -r line; do
         IFS=" " read PID CMD <<< $line
@@ -273,7 +315,7 @@ if [ -n "$SCARABMODE" ]; then
         fi
       done < <(docker top "$CONTAINER_NAME" -eo pid,cmd)
     elif [ "$APP_GROUPNAME" == "isca2024_udp" ] || [ "$APP_GROUPNAME" == "docker_traces" ] || [ "$APP_GROUPNAME" == "cse220" ]; then
-      cp "${APP_GROUPNAME}/${EXPERIMENT}.json" "$OUTDIR"
+      copy_experiment_descriptor "${APP_GROUPNAME}/${EXPERIMENT}.json"
       docker exec --user $USER --workdir /home/$USER --privileged "$CONTAINER_NAME" python3 /usr/local/bin/run_exp_using_descriptor.py -d $EXPERIMENT.json -a $APPNAME -g $APP_GROUPNAME -m $SCARABMODE &
       while read -r line; do
         IFS=" " read PID CMD <<< $line
@@ -282,7 +324,7 @@ if [ -n "$SCARABMODE" ]; then
         fi
       done < <(docker top "$CONTAINER_NAME" -eo pid,cmd)
     else
-      cp "${EXPERIMENT}.json" "$OUTDIR"
+      copy_experiment_descriptor "${EXPERIMENT}.json"
       docker exec --user $USER --workdir /home/$USER --privileged "$CONTAINER_NAME" python3 /usr/local/bin/run_exp_using_descriptor.py -d $EXPERIMENT.json -a $APPNAME -g $APP_GROUPNAME -c $BINCMD -m $SCARABMODE &
       while read -r line; do
         IFS=" " read PID CMD <<< $line
@@ -313,7 +355,7 @@ if [ -n "$PLOT" ]; then
     else
       docker cp ./plot/. "$CONTAINER_NAME":/usr/local/bin/plot
     fi
-    cp "${APP_GROUPNAME}/${EXPERIMENT}.json" "$OUTDIR"
+    copy_experiment_descriptor "${APP_GROUPNAME}/${EXPERIMENT}.json"
     docker exec --user $USER --env USER=$USER --env EXPERIMENT=$EXPERIMENT --workdir /home/$USER --privileged "$CONTAINER_NAME" /bin/bash /usr/local/bin/plot/plot_figures.sh
   done < apps.list
 fi

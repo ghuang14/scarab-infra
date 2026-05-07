@@ -229,16 +229,24 @@ case $APPNAME in
     BINCMD="/home/$USER/scarab/utils/qsort/test_qsort"
     ;;
   allbench)
-    echo "No BINCMD available for allbench"
+    if [ -n "$SIMPOINT" ]; then
+      echo "No BINCMD available for allbench"
+    fi
     ;;
   isca2024)
-    echo "No BINCMD available for isca2024 trace runs"
+    if [ -n "$SIMPOINT" ]; then
+      echo "No BINCMD available for isca2024 trace runs"
+    fi
     ;;
   cse220)
-    echo "No BINCMD available for cse220 trace runs"
+    if [ -n "$SIMPOINT" ]; then
+      echo "No BINCMD available for cse220 trace runs"
+    fi
     ;;
   docker_traces)
-    echo "No BINCMD available for docker_traces trace runs"
+    if [ -n "$SIMPOINT" ]; then
+      echo "No BINCMD available for docker_traces trace runs"
+    fi
     ;;
   *)
     echo "unknown application"

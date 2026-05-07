@@ -2,6 +2,7 @@ import json
 import argparse
 import os
 import subprocess
+import sys
 
 def read_descriptor_from_json(filename="experiment.json"):
     # Read the descriptor data from a JSON file
@@ -17,6 +18,7 @@ def read_descriptor_from_json(filename="experiment.json"):
         return None
 
 def run_experiment():
+    processes = set()
     try:
         # run_exp_using_descriptor.py
         # -d $EXPERIMENT.json
@@ -43,15 +45,16 @@ def run_experiment():
         descriptor_data = read_descriptor_from_json(descriptor_filename)
 
         # Check if reading was successful
-        if descriptor_data is not None:
-            print("Descriptor data read successfully:")
-            print(descriptor_data)
+        if descriptor_data is None:
+            return 1
+
+        print("Descriptor data read successfully:")
+        print(descriptor_data)
 
         architecture = descriptor_data["architecture"]
         experiment = descriptor_data["experiment"]
 
         # Run Scarab
-        processes = set()
         max_processes = 10
         for workload in descriptor_data["workloads_list"]:
             for config_key in descriptor_data["configurations"].keys():
@@ -62,7 +65,7 @@ def run_experiment():
                     continue
                 config_value = descriptor_data["configurations"][config_key]
                 command = 'run_cse220.sh "' + workload + '" "' + args.application_group_name + '" "" "' + experiment + '/' + config_key + '" "' + config_value + '" "' + args.scarab_mode + '" "' + architecture + '"'
-                process = subprocess.Popen("exec " + command, stdout=subprocess.PIPE, shell=True)
+                process = subprocess.Popen("exec " + command, shell=True)
                 processes.add(process)
                 while len(processes) >= max_processes:
                     # Loop through the processes and wait for one to finish
@@ -83,4 +86,4 @@ def run_experiment():
             p.kill()
 
 if __name__ == "__main__":
-    run_experiment()
+    sys.exit(run_experiment() or 0)

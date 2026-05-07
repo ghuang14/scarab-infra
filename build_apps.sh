@@ -57,27 +57,28 @@ detect_scarab_build_jobs() {
   printf '%s\n' "$cpu_count"
 }
 
-patch_scarab_makefile() {
-  local makefile="$OUTDIR/scarab/src/Makefile"
+patch_scarab_makefile_in_container() {
   local jobs="$1"
+  local makefile="/home/$USER/scarab/src/Makefile"
 
-  if [ ! -f "$makefile" ]; then
-    return 0
-  fi
-
-  SCARAB_PATCH_JOBS="$jobs" perl -0pi -e '
+  run_step docker exec --privileged "$CONTAINER_NAME" \
+    env SCARAB_PATCH_JOBS="$jobs" perl -0pi -e '
     my $jobs = $ENV{SCARAB_PATCH_JOBS};
     s/^SCARAB_MAKE_JOBS \?= .*$/SCARAB_MAKE_JOBS ?= $jobs/m
       or s/^(BUILD_DIR_PREFIX = build\n)/$1\nSCARAB_MAKE_JOBS ?= $jobs\n/m;
+    s/^SCARAB_CMAKE_ARGS \?= .*$/SCARAB_CMAKE_ARGS ?= -DSCARAB_ENABLE_LTO=OFF/m
+      or s/^(SCARAB_MAKE_JOBS \?= .*\n)/$1SCARAB_CMAKE_ARGS ?= -DSCARAB_ENABLE_LTO=OFF\n/m;
     s/^\tmake --no-print-directory -j all$/\t\$(MAKE) --no-print-directory -j\$(SCARAB_MAKE_JOBS) all/m;
     s/^\t\@make -j --no-print-directory -C \$\(dir \$@\)$/\t\@\$(MAKE) -j\$(SCARAB_MAKE_JOBS) --no-print-directory -C \$(dir \$@)/m;
+    s/^(\t\s*\$\(CMAKE\) \.\.\/\.\. -DCMAKE_BUILD_TYPE=\$\(BUILD_TYPE\))(?:\s+\$\(SCARAB_CMAKE_ARGS\))?$/\1 \$(SCARAB_CMAKE_ARGS)/m;
   ' "$makefile"
+  run_step docker exec --privileged "$CONTAINER_NAME" chown "$USER_ID:$GROUP_ID" "$makefile"
 }
 
 build_scarab_in_container() {
-  patch_scarab_makefile "$SCARAB_BUILD_JOBS_LIMIT" || return $?
+  patch_scarab_makefile_in_container "$SCARAB_BUILD_JOBS_LIMIT" || return $?
   echo "building scarab with $SCARAB_BUILD_JOBS_LIMIT parallel job(s).."
-  run_step docker exec --user=$USER --privileged "$CONTAINER_NAME" /bin/bash -c "cd /home/$USER/scarab/src && make clean && make SCARAB_MAKE_JOBS=$SCARAB_BUILD_JOBS_LIMIT" || return $?
+  run_step docker exec --user="$USER" --privileged "$CONTAINER_NAME" /bin/bash -c "set -e; cmake_bin=\$(command -v cmake3 || command -v cmake); cd /home/$USER/scarab/src && make clean && make CMAKE=\"\$cmake_bin\" SCARAB_MAKE_JOBS=$SCARAB_BUILD_JOBS_LIMIT SCARAB_CMAKE_ARGS=-DSCARAB_ENABLE_LTO=OFF" || return $?
 }
 
 SCARAB_BUILD_JOBS_LIMIT="$(detect_scarab_build_jobs)"
